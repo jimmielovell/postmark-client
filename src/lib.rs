@@ -10,8 +10,8 @@ mod error;
 
 use std::time::Duration;
 
-use crate::attachment::Attachment;
-use crate::error::ClientError;
+pub use crate::attachment::Attachment;
+pub use crate::error::{ClientError, ParseError};
 pub use reqwest::Url;
 pub use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
