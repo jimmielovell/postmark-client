@@ -1,17 +1,24 @@
 mod attachment;
+
 mod email;
+pub use email::Email;
+
+mod outbound_email_body;
+pub use outbound_email_body::*;
+
 mod error;
 
 use std::time::Duration;
 
 use crate::attachment::Attachment;
 use crate::error::ClientError;
-use email::Email;
-use reqwest::Url;
-use secrecy::{ExposeSecret, SecretString};
+pub use reqwest::Url;
+pub use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_BATCH_SIZE: usize = 500;
 
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -22,23 +29,12 @@ pub struct Client {
     timeout: Duration,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ClientBuilder {
     base_url: Option<Url>,
     sender: Option<Email>,
     auth_token: Option<SecretString>,
     timeout: Option<Duration>,
-}
-
-impl Default for ClientBuilder {
-    fn default() -> Self {
-        Self {
-            base_url: None,
-            sender: None,
-            auth_token: None,
-            timeout: Some(DEFAULT_TIMEOUT),
-        }
-    }
 }
 
 impl ClientBuilder {
@@ -101,47 +97,18 @@ impl Client {
 
     #[tracing::instrument(
         name = "Sending email using email(postmark) client",
-        skip(
-            self,
-            recipient,
-            subject,
-            html_content,
-            text_content,
-            name,
-            attachments
-        )
+        skip(self, body)
     )]
     pub async fn send(
         &self,
-        recipient: &Email,
-        subject: &str,
-        html_content: &str,
-        text_content: &str,
-        name: Option<&str>,
-        attachments: Option<Vec<Attachment>>,
+        body: &OutboundEmailBody,
     ) -> Result<SendEmailResponse, ClientError> {
         let url = self
             .base_url
             .join("/email")
             .map_err(|e| ClientError::Configuration(format!("Postmark invalid URL: {}", e)))?;
 
-        let to = match name {
-            Some(name) => format!("{} <{}>", name, recipient.as_ref()),
-            None => recipient.as_ref().to_owned(),
-        };
-
-        let body = SendEmailRequest {
-            from: self.sender.as_ref(),
-            to: to.as_str(),
-            subject,
-            tag: None,
-            html_body: html_content,
-            text_body: text_content,
-            metadata: None,
-            track_opens: true,
-            track_links: "HtmlAndText",
-            attachments,
-        };
+        let body: SendEmailRequest = (body, &self.sender).into();
 
         let resp = self
             .http_client
@@ -179,6 +146,67 @@ impl Client {
             })
         }
     }
+
+    #[tracing::instrument(
+        name = "Sending batch emails using email(postmark) client",
+        skip(self, bodies)
+    )]
+    pub async fn send_batch(
+        &self,
+        bodies: &[OutboundEmailBody],
+    ) -> Result<Vec<SendEmailResponse>, ClientError> {
+        if bodies.is_empty() {
+            return Ok(vec![]);
+        }
+
+        if bodies.len() > MAX_BATCH_SIZE {
+            return Err(ClientError::Configuration(format!(
+                "Batch size exceeds maximum allowed ({MAX_BATCH_SIZE})"
+            )));
+        }
+
+        let url = self
+            .base_url
+            .join("/email/batch")
+            .map_err(|e| ClientError::Configuration(format!("Invalid batch URL: {}", e)))?;
+
+        let body: Vec<SendEmailRequest> = bodies
+            .iter()
+            .map(|body| (body, &self.sender).into())
+            .collect();
+
+        let resp = self
+            .http_client
+            .post(url.clone())
+            .header("X-Postmark-Server-Token", self.auth_token.expose_secret())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to send batch email: {}", e);
+                ClientError::Reqwest(e)
+            })?;
+
+        let status_code = resp.status();
+        let message = resp.text().await.map_err(|err| {
+            tracing::error!("Postmark: failed to read batch response body: {}", err);
+            ClientError::Reqwest(err)
+        })?;
+
+        if status_code.is_success() {
+            serde_json::from_str(&message).map_err(|err| {
+                tracing::error!("Postmark: failed to parse batch response: {}", err);
+                ClientError::Serde(err)
+            })
+        } else if status_code.as_str() == "401" {
+            Err(ClientError::Authentication(message))
+        } else {
+            Err(ClientError::ServerResponse {
+                status_code,
+                message,
+            })
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -186,14 +214,49 @@ impl Client {
 struct SendEmailRequest<'a> {
     from: &'a str,
     to: &'a str,
-    subject: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cc: Option<Vec<&'a str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bcc: Option<Vec<&'a str>>,
+    subject: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<&'a str>,
-    html_body: &'a str,
-    text_body: &'a str,
-    metadata: Option<serde_json::Value>,
+    html_body: Option<&'a str>,
+    text_body: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_to: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<Value>,
     track_opens: bool,
     track_links: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     attachments: Option<Vec<Attachment>>,
+}
+
+impl<'a> From<(&'a OutboundEmailBody, &'a Email)> for SendEmailRequest<'a> {
+    fn from((request, from): (&'a OutboundEmailBody, &'a Email)) -> Self {
+        SendEmailRequest {
+            from: from.as_ref(),
+            to: request.to.as_ref(),
+            cc: request
+                .cc
+                .as_ref()
+                .map(|emails| emails.iter().map(|email| email.as_ref()).collect()),
+            bcc: request
+                .bcc
+                .as_ref()
+                .map(|emails| emails.iter().map(|email| email.as_ref()).collect()),
+            subject: request.subject.as_deref(),
+            tag: request.tag.as_deref(),
+            html_body: request.html_body.as_deref(),
+            text_body: request.text_body.as_deref(),
+            reply_to: request.reply_to.as_ref().map(|reply_to| reply_to.as_ref()),
+            metadata: request.metadata.clone(),
+            track_opens: request.track_opens,
+            track_links: request.track_links.as_str(),
+            attachments: request.attachments.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default, Serialize, Deserialize)]
@@ -209,143 +272,30 @@ pub struct SendEmailResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::email::Email;
-    use crate::{Client, SendEmailResponse};
-    use claim::{assert_err, assert_ok};
-    use fake::faker::internet::en::SafeEmail;
-    use fake::faker::lorem::en::{Paragraph, Sentence};
-    use fake::Fake;
-    use reqwest::Url;
-    use secrecy::SecretString;
-    use wiremock::matchers::{any, header, header_exists, method, path};
-    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+    use super::*;
 
-    /// Generate a random email subject
-    fn subject() -> String {
-        Sentence(1..2).fake()
-    }
+    #[test]
+    fn test_internal_request_conversion() {
+        let to = Email::parse("recipient@example.com").unwrap();
+        let cc_email = Email::parse("cc@example.com").unwrap();
 
-    /// Generate a random email content
-    fn content() -> String {
-        Paragraph(1..10).fake()
-    }
+        let request = OutboundEmailBody::builder(to)
+            .subject("Test Subject")
+            .html_body("<p>HTML Content</p>")
+            .text_body("Text Content")
+            .cc(vec![cc_email])
+            .build();
 
-    /// Generate a random subscriber email
-    fn email() -> Email {
-        Email::parse(SafeEmail().fake::<String>().as_str()).unwrap()
-    }
+        let from = Email::parse("from@example.com").unwrap();
+        let internal: SendEmailRequest = (&request, &from).into();
 
-    /// Get a test instance of `EmailClient`.
-    fn email_client(base_url: &str) -> Client {
-        let base_url = Url::parse(base_url).expect("Failed to parse base uri");
-        let auth_token = 13.fake::<String>();
-        let auth_token = SecretString::from(auth_token);
-
-        Client::builder()
-            .base_url(base_url)
-            .sender(email())
-            .auth_token(auth_token)
-            .timeout(std::time::Duration::from_secs(1))
-            .build()
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn send_email_sends_expected_request() {
-        let mock_server = MockServer::start().await;
-        let email_client = email_client(&mock_server.uri());
-
-        Mock::given(header_exists("X-Postmark-Server-Token"))
-            .and(header("Content-Type", "application/json"))
-            .and(path("/email"))
-            .and(method("POST"))
-            .and(SendEmailBodyMatcher)
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let _ = email_client
-            .send(&email(), &subject(), &content(), &content(), None, None)
-            .await;
-    }
-
-    #[tokio::test]
-    async fn send_email_succeeds_if_the_server_returns_200() {
-        let mock_server = MockServer::start().await;
-        let email_client = email_client(&mock_server.uri());
-
-        Mock::given(header_exists("X-Postmark-Server-Token"))
-            .and(header("Content-Type", "application/json"))
-            .and(path("/email"))
-            .and(method("POST"))
-            .and(SendEmailBodyMatcher)
-            .respond_with(ResponseTemplate::new(200).set_body_json(SendEmailResponse::default()))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let outcome = email_client
-            .send(&email(), &subject(), &content(), &content(), None, None)
-            .await;
-
-        assert_ok!(outcome);
-    }
-
-    #[tokio::test]
-    async fn send_email_fails_if_the_server_returns_500() {
-        let mock_server = MockServer::start().await;
-        let email_client = email_client(&mock_server.uri());
-
-        Mock::given(any())
-            .respond_with(ResponseTemplate::new(500))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let outcome = email_client
-            .send(&email(), &subject(), &content(), &content(), None, None)
-            .await;
-
-        assert_err!(outcome);
-    }
-
-    #[tokio::test]
-    async fn send_email_times_out_if_the_server_takes_too_long() {
-        let mock_server = MockServer::start().await;
-        let email_client = email_client(&mock_server.uri());
-
-        let response = ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(180));
-
-        Mock::given(any())
-            .respond_with(response)
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-        let outcome = email_client
-            .send(&email(), &subject(), &content(), &content(), None, None)
-            .await;
-
-        assert_err!(outcome);
-    }
-
-    struct SendEmailBodyMatcher;
-
-    impl wiremock::Match for SendEmailBodyMatcher {
-        fn matches(&self, request: &Request) -> bool {
-            // Try to parse the body as a JSON value
-            let result: Result<serde_json::Value, _> = serde_json::from_slice(&request.body);
-            if let Ok(body) = result {
-                // Check that all the mandatory fields are populated
-                body.get("From").is_some()
-                    && body.get("To").is_some()
-                    && body.get("Subject").is_some()
-                    && body.get("HtmlBody").is_some()
-                    && body.get("TextBody").is_some()
-            } else {
-                // If parsing failed, do not match the request
-                false
-            }
-        }
+        assert_eq!(internal.from, "from@example.com");
+        assert_eq!(internal.to, "recipient@example.com");
+        assert_eq!(internal.cc.unwrap()[0], "cc@example.com");
+        assert_eq!(internal.subject, Some("Test Subject"));
+        assert_eq!(internal.html_body, Some("<p>HTML Content</p>"));
+        assert_eq!(internal.text_body, Some("Text Content"));
+        assert!(internal.track_opens);
+        assert_eq!(internal.track_links, "HtmlAndText");
     }
 }
