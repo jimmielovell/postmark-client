@@ -218,10 +218,13 @@ struct SendEmailRequest<'a> {
     cc: Option<Vec<&'a str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bcc: Option<Vec<&'a str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     subject: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     html_body: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     text_body: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_to: Option<&'a str>,
