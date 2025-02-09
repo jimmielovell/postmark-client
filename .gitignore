@@ -9,3 +9,5 @@
 /.idea
 
 .env
+
+Cargo.lock
