@@ -6,14 +6,15 @@ pub use email::Email;
 mod outbound_email_body;
 pub use outbound_email_body::*;
 
-mod error;
+pub mod error;
+use crate::error::ClientError;
 
 use std::time::Duration;
 
 pub use crate::attachment::Attachment;
-pub use crate::error::{ClientError, ParseError};
 pub use reqwest::Url;
 pub use secrecy::{ExposeSecret, SecretString};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
