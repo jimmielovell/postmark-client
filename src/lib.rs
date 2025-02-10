@@ -97,7 +97,7 @@ impl Client {
     }
 
     #[tracing::instrument(
-        name = "Sending email using email(postmark) client",
+        name = "Send email using email(postmark) client",
         skip(self, body)
     )]
     pub async fn send(
@@ -149,7 +149,7 @@ impl Client {
     }
 
     #[tracing::instrument(
-        name = "Sending batch emails using email(postmark) client",
+        name = "Send batch emails using postmark client",
         skip(self, bodies)
     )]
     pub async fn send_batch(
