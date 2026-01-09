@@ -50,7 +50,7 @@ impl Email {
 
     pub fn hash(&self) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(self.0.as_bytes());
+        hasher.update(self.0.to_lowercase().as_bytes());
         hasher.finalize().to_string()
     }
 }

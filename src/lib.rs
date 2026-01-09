@@ -169,7 +169,7 @@ impl Client {
         let url = self
             .base_url
             .join("/email/batch")
-            .map_err(|e| ClientError::Configuration(format!("Invalid batch URL: {}", e)))?;
+            .map_err(|err| ClientError::Configuration(format!("Invalid batch URL: {err:?}")))?;
 
         let body: Vec<SendEmailRequest> = bodies
             .iter()
@@ -183,20 +183,20 @@ impl Client {
             .json(&body)
             .send()
             .await
-            .map_err(|e| {
-                tracing::error!("Failed to send batch email: {}", e);
-                ClientError::Reqwest(e)
+            .map_err(|err| {
+                tracing::error!("Failed to send batch email: {err:?}");
+                ClientError::Reqwest(err)
             })?;
 
         let status_code = resp.status();
         let message = resp.text().await.map_err(|err| {
-            tracing::error!("Postmark: failed to read batch response body: {}", err);
+            tracing::error!("Postmark: failed to read batch response body: {err:?}");
             ClientError::Reqwest(err)
         })?;
 
         if status_code.is_success() {
             serde_json::from_str(&message).map_err(|err| {
-                tracing::error!("Postmark: failed to parse batch response: {}", err);
+                tracing::error!("Postmark: failed to parse batch response: {err:?}");
                 ClientError::Serde(err)
             })
         } else if status_code.as_str() == "401" {
