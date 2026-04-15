@@ -48,6 +48,28 @@ impl Email {
         Email(email)
     }
 
+    pub fn mask(&self) -> String {
+        let parts: Vec<&str> = self.0.split('@').collect();
+        if parts.len() != 2 {
+            return self.0.clone();
+        }
+
+        let local = parts[0];
+        let domain = parts[1];
+
+        let local_first = local.chars().next().unwrap_or('*');
+        let local_masked = format!("{local_first}***");
+
+        let domain_masked = if let Some((name, tld)) = domain.split_once('.') {
+            let name_first = name.chars().next().unwrap_or('*');
+            format!("{name_first}***.{tld}")
+        } else {
+            domain.to_string()
+        };
+
+        format!("{local_masked}@{domain_masked}")
+    }
+
     pub fn hash(&self) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(self.0.to_lowercase().as_bytes());
@@ -134,6 +156,18 @@ mod tests {
         for email in test_cases {
             assert_err!(Email::parse(email));
         }
+    }
+
+    #[test]
+    fn email_is_masked_correctly() {
+        let email1 = Email::parse("john.doe@gmail.com").unwrap();
+        assert_eq!(email1.mask(), "j***@g***.com");
+
+        let email2 = Email::parse("admin@yahoo.co.uk").unwrap();
+        assert_eq!(email2.mask(), "a***@y***.co.uk");
+
+        let email3 = Email::parse("a@b.com").unwrap();
+        assert_eq!(email3.mask(), "a***@b***.com");
     }
 
     #[quickcheck_macros::quickcheck]
